@@ -2,3 +2,4 @@ venv
 reports
 output
 submission.csv
+__pycache__
