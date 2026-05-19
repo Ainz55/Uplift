@@ -3,3 +3,4 @@ reports
 output
 submission.csv
 __pycache__
+.idea
