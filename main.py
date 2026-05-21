@@ -9,6 +9,10 @@ import sys
 import warnings
 from pathlib import Path
 
+from runtime_env import configure_runtime_storage
+
+configure_runtime_storage()
+
 import numpy as np
 import pandas as pd
 
@@ -85,7 +89,7 @@ def run(cfg: PipelineConfig) -> None:
         test,
         max_categories=cfg.max_categories,
     )
-    y = train[TARGET_COL].to_numpy(dtype=float)
+    y = train[TARGET_COL].to_numpy(dtype=np.float32)
     treatment = train[TREATMENT_COL].to_numpy(dtype=np.int8)
 
     logger.info("Cross-validation and model selection...")
@@ -167,6 +171,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=float, default=None)
     parser.add_argument("--bootstrap-iterations", type=int, default=None)
     parser.add_argument("--max-categories", type=int, default=None)
+    parser.add_argument(
+        "--models",
+        type=str,
+        default=None,
+        help="Comma-separated model names, e.g. hurdle_t_learner,t_learner_log",
+    )
     return parser
 
 
@@ -196,6 +206,8 @@ def main() -> None:
         cfg.bootstrap_iterations = args.bootstrap_iterations
     if args.max_categories is not None:
         cfg.max_categories = args.max_categories
+    if args.models:
+        cfg.model_names = tuple(name.strip() for name in args.models.split(",") if name.strip())
 
     run(cfg)
 

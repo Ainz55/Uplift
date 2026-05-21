@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass, field
 
@@ -22,7 +23,6 @@ class CVResult:
     fold_metrics: pd.DataFrame
     summary: dict[str, float]
     oof_uplift: np.ndarray = field(repr=False)
-    fold_models: list[BaseUpliftModel] = field(default_factory=list, repr=False)
 
 
 @dataclass
@@ -109,9 +109,8 @@ def _run_cv_single(
         strata = treatment
 
     skf = StratifiedKFold(n_splits=cfg.n_folds, shuffle=True, random_state=cfg.random_state)
-    oof = np.zeros(len(y), dtype=float)
+    oof = np.zeros(len(y), dtype=np.float32)
     fold_rows: list[dict] = []
-    fold_models: list[BaseUpliftModel] = []
 
     for fold, (tr_idx, oof_idx) in enumerate(skf.split(X, strata), start=1):
         fit_idx, es_idx = stratified_holdout_split(
@@ -131,7 +130,7 @@ def _run_cv_single(
         )
 
         uplift_oof = model.predict(X.iloc[oof_idx])
-        oof[oof_idx] = uplift_oof
+        oof[oof_idx] = uplift_oof.astype(np.float32, copy=False)
 
         metrics = _evaluate(
             y[oof_idx],
@@ -142,7 +141,6 @@ def _run_cv_single(
         )
         metrics["fold"] = fold
         fold_rows.append(metrics)
-        fold_models.append(model)
 
         main_pct = int(round(cfg.top_k * 100))
         logger.info(
@@ -154,10 +152,13 @@ def _run_cv_single(
             metrics[f"uplift_at_{main_pct}pct_ci_lower"],
             metrics["auuc"],
         )
+        del model, uplift_oof
+        gc.collect()
 
     fold_df = pd.DataFrame(fold_rows)
     summary = {k: float(v) for k, v in _evaluate(y, oof, treatment, cfg).items()}
-    return CVResult(model_name=model_name, fold_metrics=fold_df, summary=summary, oof_uplift=oof, fold_models=fold_models)
+
+    return CVResult(model_name=model_name, fold_metrics=fold_df, summary=summary, oof_uplift=oof)
 
 
 def cross_validate_all_models(
@@ -173,7 +174,8 @@ def cross_validate_all_models(
         cfg.top_k * 100,
     )
     results: dict[str, CVResult] = {}
-    for name in ALL_MODELS:
+    model_names = cfg.model_names or ALL_MODELS
+    for name in model_names:
         logger.info("Cross-validating model: %s", name)
         results[name] = _run_cv_single(name, X, y, treatment, cfg)
         logger.info(
@@ -191,10 +193,11 @@ def build_ensemble_cv(
     treatment: np.ndarray,
     cfg: PipelineConfig,
     *,
+    candidate_names: list[str] | tuple[str, ...] | None = None,
     rank_average: bool = False,
     top_n: int | None = None,
 ) -> CVResult:
-    names = list(results.keys())
+    names = list(candidate_names) if candidate_names is not None else list(results.keys())
     key = _metric_key(cfg)
     if top_n is not None and top_n < len(names):
         names = sorted(names, key=lambda n: results[n].summary[key], reverse=True)[:top_n]
@@ -236,10 +239,19 @@ def select_best_model(
     cfg: PipelineConfig,
 ) -> EvaluationReport:
     all_cv = cross_validate_all_models(X, y, treatment, cfg)
-    all_cv["ensemble"] = build_ensemble_cv(all_cv, y, treatment, cfg)
-    all_cv["rank_ensemble"] = build_ensemble_cv(all_cv, y, treatment, cfg, rank_average=True)
-    all_cv["top_ensemble"] = build_ensemble_cv(all_cv, y, treatment, cfg, top_n=4)
-    all_cv["rank_top_ensemble"] = build_ensemble_cv(all_cv, y, treatment, cfg, rank_average=True, top_n=4)
+    base_model_names = list(all_cv.keys())
+    all_cv["ensemble"] = build_ensemble_cv(
+        all_cv, y, treatment, cfg, candidate_names=base_model_names,
+    )
+    all_cv["rank_ensemble"] = build_ensemble_cv(
+        all_cv, y, treatment, cfg, candidate_names=base_model_names, rank_average=True,
+    )
+    all_cv["top_ensemble"] = build_ensemble_cv(
+        all_cv, y, treatment, cfg, candidate_names=base_model_names, top_n=4,
+    )
+    all_cv["rank_top_ensemble"] = build_ensemble_cv(
+        all_cv, y, treatment, cfg, candidate_names=base_model_names, rank_average=True, top_n=4,
+    )
 
     key = _metric_key(cfg)
     best_name = max(all_cv, key=lambda n: all_cv[n].summary[key])

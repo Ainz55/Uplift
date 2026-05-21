@@ -88,15 +88,15 @@ class FeatureBuilder:
         if self.numeric_columns_:
             numeric = df[self.numeric_columns_].apply(pd.to_numeric, errors="coerce")
             numeric = numeric.replace([np.inf, -np.inf], np.nan)
-            missing_flags = numeric.isna().astype(np.int8)
+            missing_flags = numeric.isna().astype(np.float32)
             missing_flags.columns = [f"{c}__missing" for c in missing_flags.columns]
-            numeric = numeric.fillna(self.numeric_medians_).astype(float)
+            numeric = numeric.fillna(self.numeric_medians_).astype(np.float32)
             parts.extend([numeric, missing_flags])
 
             if self.log_columns_:
                 log_df = pd.DataFrame(index=df.index)
                 for col in self.log_columns_:
-                    log_df[f"{col}__log1p"] = np.log1p(numeric[col].clip(lower=0))
+                    log_df[f"{col}__log1p"] = np.log1p(numeric[col].clip(lower=0)).astype(np.float32)
                 parts.append(log_df)
 
         for col in self.categorical_columns_:
@@ -105,15 +105,16 @@ class FeatureBuilder:
             cat_df = pd.DataFrame(index=df.index)
             for level in levels:
                 safe_level = str(level).replace(" ", "_").replace("/", "_")
-                cat_df[f"{col}__{safe_level}"] = (raw == level).astype(np.int8)
-            cat_df[f"{col}__OTHER"] = (~raw.isin(levels)).astype(np.int8)
+                cat_df[f"{col}__{safe_level}"] = (raw == level).astype(np.float32)
+            cat_df[f"{col}__OTHER"] = (~raw.isin(levels)).astype(np.float32)
             parts.append(cat_df)
 
         if not parts:
             return pd.DataFrame(index=df.index)
 
         result = pd.concat(parts, axis=1)
-        return result.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        result = result.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        return result.astype(np.float32, copy=False)
 
     def fit_transform(
         self,

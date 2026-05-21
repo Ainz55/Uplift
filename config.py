@@ -51,6 +51,7 @@ class PipelineConfig:
     bootstrap_iterations: int = 200
     bootstrap_ci: float = 0.80
     max_categories: int = 40
+    model_names: tuple[str, ...] | None = None
     lgbm: LGBMParams = field(default_factory=LGBMParams)
 
     def resolved_train_path(self) -> Path:
