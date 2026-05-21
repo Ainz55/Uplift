@@ -1,152 +1,139 @@
-"""Построение признаков клиентов для uplift-модели."""
+"""Feature preparation for train/test tables with the official schema."""
 
 from __future__ import annotations
+
+import logging
 
 import numpy as np
 import pandas as pd
 
-from config import AGE_MAX, AGE_MIN
+from data import COMMUNICATION_COL, ID_COL, TARGET_COL, TREATMENT_COL
+
+logger = logging.getLogger(__name__)
 
 
 class FeatureBuilder:
-    """Инженерия признаков из справочника clients.csv."""
+    """Deterministic preprocessing without target leakage."""
 
-    def __init__(self, reference_date: pd.Timestamp | None = None) -> None:
-        self.reference_date = reference_date
+    def __init__(self, *, max_categories: int = 40) -> None:
+        self.max_categories = max_categories
+        self.base_feature_columns_: list[str] = []
+        self.numeric_columns_: list[str] = []
+        self.categorical_columns_: list[str] = []
+        self.numeric_medians_: pd.Series = pd.Series(dtype=float)
+        self.log_columns_: list[str] = []
+        self.category_levels_: dict[str, list[object]] = {}
         self.feature_columns_: list[str] = []
-        self.age_median_: float = 45.0
 
-    def fit(self, clients: pd.DataFrame) -> FeatureBuilder:
-        ages = self._clean_age(clients["age"])
-        self.age_median_ = float(ages.median())
-        if self.reference_date is None:
-            issue = pd.to_datetime(clients["first_issue_date"], errors="coerce")
-            self.reference_date = issue.max()
+    def fit(self, train: pd.DataFrame, test: pd.DataFrame) -> FeatureBuilder:
+        reserved = {ID_COL, TREATMENT_COL, TARGET_COL}
+        self.base_feature_columns_ = [c for c in train.columns if c not in reserved]
+        missing = [c for c in self.base_feature_columns_ if c not in test.columns]
+        if missing:
+            raise ValueError(f"test is missing train feature columns: {missing[:20]}")
+
+        feature_df = train[self.base_feature_columns_].copy()
+
+        forced_categorical = {COMMUNICATION_COL}
+        self.categorical_columns_ = [
+            c
+            for c in self.base_feature_columns_
+            if c in forced_categorical
+            or pd.api.types.is_object_dtype(feature_df[c])
+            or pd.api.types.is_categorical_dtype(feature_df[c])
+            or pd.api.types.is_bool_dtype(feature_df[c])
+        ]
+        self.numeric_columns_ = [
+            c for c in self.base_feature_columns_ if c not in self.categorical_columns_
+        ]
+
+        numeric = feature_df[self.numeric_columns_].apply(pd.to_numeric, errors="coerce")
+        numeric = numeric.replace([np.inf, -np.inf], np.nan)
+        self.numeric_medians_ = numeric.median().fillna(0.0)
+
+        self.log_columns_ = []
+        for col in self.numeric_columns_:
+            s = numeric[col]
+            clean = s.dropna()
+            if clean.empty:
+                continue
+            non_negative = bool((clean >= 0).all())
+            skewed = abs(float(clean.skew())) > 2.0 if len(clean) > 2 else False
+            if non_negative and skewed:
+                self.log_columns_.append(col)
+
+        self.category_levels_ = {}
+        for col in self.categorical_columns_:
+            values = feature_df[col].astype("object").where(feature_df[col].notna(), "__MISSING__")
+            levels = values.value_counts(dropna=False).head(self.max_categories).index.tolist()
+            self.category_levels_[col] = levels
+
+        transformed = self.transform(train)
+        self.feature_columns_ = list(transformed.columns)
+        logger.info(
+            "Features: %d numeric, %d categorical, %d final columns",
+            len(self.numeric_columns_),
+            len(self.categorical_columns_),
+            len(self.feature_columns_),
+        )
         return self
 
-    @staticmethod
-    def _clean_age(age: pd.Series) -> pd.Series:
-        age = pd.to_numeric(age, errors="coerce")
-        valid = age.between(AGE_MIN, AGE_MAX)
-        cleaned = age.where(valid)
-        return cleaned
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        missing = [c for c in self.base_feature_columns_ if c not in df.columns]
+        if missing:
+            raise ValueError(f"input is missing feature columns: {missing[:20]}")
 
-    def transform(self, clients: pd.DataFrame) -> pd.DataFrame:
-        df = clients.copy()
-        df["first_issue_date"] = pd.to_datetime(df["first_issue_date"], errors="coerce")
-        df["first_redeem_date"] = pd.to_datetime(df["first_redeem_date"], errors="coerce")
+        parts: list[pd.DataFrame] = []
 
-        ref = self.reference_date
-        df["days_since_issue"] = (ref - df["first_issue_date"]).dt.days
-        df["days_since_redeem"] = (ref - df["first_redeem_date"]).dt.days
-        df["days_issue_to_redeem"] = (df["first_redeem_date"] - df["first_issue_date"]).dt.days
+        if self.numeric_columns_:
+            numeric = df[self.numeric_columns_].apply(pd.to_numeric, errors="coerce")
+            numeric = numeric.replace([np.inf, -np.inf], np.nan)
+            missing_flags = numeric.isna().astype(np.int8)
+            missing_flags.columns = [f"{c}__missing" for c in missing_flags.columns]
+            numeric = numeric.fillna(self.numeric_medians_).astype(float)
+            parts.extend([numeric, missing_flags])
 
-        df["has_redeemed"] = df["first_redeem_date"].notna().astype(np.int8)
-        df["issue_year"] = df["first_issue_date"].dt.year
-        df["issue_month"] = df["first_issue_date"].dt.month
-        df["issue_quarter"] = df["first_issue_date"].dt.quarter
-        df["issue_dow"] = df["first_issue_date"].dt.dayofweek
-        df["issue_is_weekend"] = df["issue_dow"].isin([5, 6]).astype(np.int8)
+            if self.log_columns_:
+                log_df = pd.DataFrame(index=df.index)
+                for col in self.log_columns_:
+                    log_df[f"{col}__log1p"] = np.log1p(numeric[col].clip(lower=0))
+                parts.append(log_df)
 
-        age_raw = pd.to_numeric(df["age"], errors="coerce")
-        age_clean = self._clean_age(df["age"])
-        df["age"] = age_clean.fillna(self.age_median_)
-        df["age_missing"] = age_clean.isna().astype(np.int8)
-        df["age_outlier"] = (~age_raw.between(AGE_MIN, AGE_MAX) & age_raw.notna()).astype(np.int8)
+        for col in self.categorical_columns_:
+            raw = df[col].astype("object").where(df[col].notna(), "__MISSING__")
+            levels = self.category_levels_.get(col, [])
+            cat_df = pd.DataFrame(index=df.index)
+            for level in levels:
+                safe_level = str(level).replace(" ", "_").replace("/", "_")
+                cat_df[f"{col}__{safe_level}"] = (raw == level).astype(np.int8)
+            cat_df[f"{col}__OTHER"] = (~raw.isin(levels)).astype(np.int8)
+            parts.append(cat_df)
 
-        df["age_group_young"] = (df["age"] < 35).astype(np.int8)
-        df["age_group_middle"] = ((df["age"] >= 35) & (df["age"] < 55)).astype(np.int8)
-        df["age_group_senior"] = (df["age"] >= 55).astype(np.int8)
-        df["age_bin_18_24"] = df["age"].between(18, 24, inclusive="both").astype(np.int8)
-        df["age_bin_25_34"] = df["age"].between(25, 34, inclusive="both").astype(np.int8)
-        df["age_bin_35_44"] = df["age"].between(35, 44, inclusive="both").astype(np.int8)
-        df["age_bin_45_54"] = df["age"].between(45, 54, inclusive="both").astype(np.int8)
-        df["age_bin_55_64"] = df["age"].between(55, 64, inclusive="both").astype(np.int8)
-        df["age_bin_65_plus"] = (df["age"] >= 65).astype(np.int8)
+        if not parts:
+            return pd.DataFrame(index=df.index)
 
-        df["log_days_since_issue"] = np.log1p(df["days_since_issue"].clip(lower=0))
-        df["log_days_issue_to_redeem"] = np.log1p(
-            df["days_issue_to_redeem"].clip(lower=0).fillna(0)
-        )
+        result = pd.concat(parts, axis=1)
+        return result.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-        df["redeem_before_issue"] = (
-            df["days_issue_to_redeem"].notna() & (df["days_issue_to_redeem"] < 0)
-        ).astype(np.int8)
-        df["quick_redeem_7d"] = df["days_issue_to_redeem"].between(0, 7, inclusive="both").astype(np.int8)
-        df["quick_redeem_30d"] = df["days_issue_to_redeem"].between(0, 30, inclusive="both").astype(np.int8)
-        df["long_redeem_180d"] = (df["days_issue_to_redeem"] > 180).astype(np.int8)
-        df["new_client_90d"] = (df["days_since_issue"] <= 90).astype(np.int8)
-        df["old_client_720d"] = (df["days_since_issue"] >= 720).astype(np.int8)
-        df["redeem_delay_ratio"] = (
-            df["days_issue_to_redeem"].clip(lower=0)
-            / (df["days_since_issue"].clip(lower=1) + 1.0)
-        ).fillna(0)
-        df["days_since_issue_x_age"] = df["log_days_since_issue"] * df["age"]
-        df["has_redeemed_x_age"] = df["has_redeemed"] * df["age"]
-
-        for col in ("days_since_redeem", "days_issue_to_redeem"):
-            df[col] = df[col].fillna(-1)
-
-        gender = pd.get_dummies(df["gender"].fillna("U"), prefix="gender", dtype=np.int8)
-        df = pd.concat([df.drop(columns=["gender"]), gender], axis=1)
-        for col in [c for c in df.columns if c.startswith("gender_")]:
-            df[f"{col}_x_has_redeemed"] = df[col] * df["has_redeemed"]
-            df[f"{col}_x_age"] = df[col] * df["age"]
-
-        self.feature_columns_ = [
-            "days_since_issue",
-            "days_since_redeem",
-            "days_issue_to_redeem",
-            "log_days_since_issue",
-            "log_days_issue_to_redeem",
-            "has_redeemed",
-            "issue_year",
-            "issue_month",
-            "issue_quarter",
-            "issue_dow",
-            "issue_is_weekend",
-            "age",
-            "age_missing",
-            "age_outlier",
-            "age_group_young",
-            "age_group_middle",
-            "age_group_senior",
-            "age_bin_18_24",
-            "age_bin_25_34",
-            "age_bin_35_44",
-            "age_bin_45_54",
-            "age_bin_55_64",
-            "age_bin_65_plus",
-            "redeem_before_issue",
-            "quick_redeem_7d",
-            "quick_redeem_30d",
-            "long_redeem_180d",
-            "new_client_90d",
-            "old_client_720d",
-            "redeem_delay_ratio",
-            "days_since_issue_x_age",
-            "has_redeemed_x_age",
-        ] + [c for c in df.columns if c.startswith("gender_")]
-
-        return df[["client_id"] + self.feature_columns_]
-
-    def fit_transform(self, clients: pd.DataFrame) -> pd.DataFrame:
-        return self.fit(clients).transform(clients)
+    def fit_transform(
+        self,
+        train: pd.DataFrame,
+        test: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+        self.fit(train, test)
+        x_train = self.transform(train)
+        x_test = self.transform(test)
+        x_test = x_test.reindex(columns=x_train.columns, fill_value=0.0)
+        self.feature_columns_ = list(x_train.columns)
+        return x_train, x_test, self.feature_columns_
 
 
 def prepare_datasets(
     train: pd.DataFrame,
     test: pd.DataFrame,
-    clients: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    builder = FeatureBuilder()
-    features = builder.fit_transform(clients)
-
-    train_df = train.merge(features, on="client_id", how="left")
-    test_df = test.merge(features, on="client_id", how="left")
-
-    feature_cols = builder.feature_columns_
-    for df in (train_df, test_df):
-        df[feature_cols] = df[feature_cols].fillna(-1)
-
-    return train_df, test_df, feature_cols
+    *,
+    max_categories: int = 40,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], FeatureBuilder]:
+    builder = FeatureBuilder(max_categories=max_categories)
+    x_train, x_test, feature_cols = builder.fit_transform(train, test)
+    return x_train, x_test, feature_cols, builder
