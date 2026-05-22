@@ -1,5 +1,7 @@
 venv
 dataset
+dataset_init
+models
 reports
 output
 submission.csv
