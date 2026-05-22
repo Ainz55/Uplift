@@ -1,4 +1,4 @@
-"""Training uplift models."""
+"""Continuous-outcome uplift models for rec_spend."""
 
 from __future__ import annotations
 
@@ -14,49 +14,74 @@ ModelName = str
 
 
 def _parse_model_name(name: str) -> tuple[str, int]:
-    """Return base model name and deterministic seed offset from names like model_s101."""
     if "_s" not in name:
         return name, 0
     base, seed = name.rsplit("_s", 1)
-    if seed.isdigit():
-        return base, int(seed)
-    return name, 0
+    return (base, int(seed)) if seed.isdigit() else (name, 0)
 
 
-def _make_lgbm_classifier(params: LGBMParams, seed_offset: int = 0) -> lgb.LGBMClassifier:
-    return lgb.LGBMClassifier(
-        n_estimators=params.n_estimators,
-        learning_rate=params.learning_rate,
-        max_depth=params.max_depth,
-        num_leaves=params.num_leaves,
-        min_child_samples=params.min_child_samples,
-        subsample=params.subsample,
-        colsample_bytree=params.colsample_bytree,
-        reg_alpha=params.reg_alpha,
-        reg_lambda=params.reg_lambda,
-        random_state=RANDOM_STATE + seed_offset,
-        verbose=-1,
-        n_jobs=-1,
-        force_col_wise=True,
-    )
+def _common_params(params: LGBMParams, seed_offset: int) -> dict:
+    return {
+        "n_estimators": params.n_estimators,
+        "learning_rate": params.learning_rate,
+        "max_depth": params.max_depth,
+        "num_leaves": params.num_leaves,
+        "min_child_samples": params.min_child_samples,
+        "subsample": params.subsample,
+        "colsample_bytree": params.colsample_bytree,
+        "reg_alpha": params.reg_alpha,
+        "reg_lambda": params.reg_lambda,
+        "random_state": RANDOM_STATE + seed_offset,
+        "verbose": -1,
+        "n_jobs": params.n_jobs,
+        "force_col_wise": True,
+        "deterministic": True,
+    }
 
 
-def _make_lgbm_regressor(params: LGBMParams, seed_offset: int = 0) -> lgb.LGBMRegressor:
-    return lgb.LGBMRegressor(
-        n_estimators=params.n_estimators,
-        learning_rate=params.learning_rate,
-        max_depth=params.max_depth,
-        num_leaves=params.num_leaves,
-        min_child_samples=params.min_child_samples,
-        subsample=params.subsample,
-        colsample_bytree=params.colsample_bytree,
-        reg_alpha=params.reg_alpha,
-        reg_lambda=params.reg_lambda,
-        random_state=RANDOM_STATE + seed_offset,
-        verbose=-1,
-        n_jobs=-1,
-        force_col_wise=True,
-    )
+def _make_regressor(params: LGBMParams, seed_offset: int = 0) -> lgb.LGBMRegressor:
+    return lgb.LGBMRegressor(objective="regression", **_common_params(params, seed_offset))
+
+
+def _make_classifier(params: LGBMParams, seed_offset: int = 0) -> lgb.LGBMClassifier:
+    return lgb.LGBMClassifier(objective="binary", **_common_params(params, seed_offset))
+
+
+def _fit_regressor(
+    model: lgb.LGBMRegressor,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    params: LGBMParams,
+    *,
+    eval_set: tuple[pd.DataFrame, np.ndarray] | None = None,
+    sample_weight: np.ndarray | None = None,
+) -> None:
+    fit_kwargs: dict = {}
+    if eval_set is not None and len(eval_set[0]) > 0:
+        fit_kwargs["eval_set"] = [eval_set]
+        fit_kwargs["callbacks"] = [lgb.early_stopping(params.early_stopping_rounds, verbose=False)]
+    if sample_weight is not None:
+        fit_kwargs["sample_weight"] = sample_weight
+    model.fit(X, y, **fit_kwargs)
+
+
+def _fit_classifier(
+    model: lgb.LGBMClassifier,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    params: LGBMParams,
+    *,
+    eval_set: tuple[pd.DataFrame, np.ndarray] | None = None,
+) -> None:
+    fit_kwargs: dict = {}
+    if eval_set is not None and len(eval_set[0]) > 0 and len(np.unique(eval_set[1])) > 1:
+        fit_kwargs["eval_set"] = [eval_set]
+        fit_kwargs["callbacks"] = [lgb.early_stopping(params.early_stopping_rounds, verbose=False)]
+    model.fit(X, y, **fit_kwargs)
+
+
+def _safe_expm1(values: np.ndarray) -> np.ndarray:
+    return np.expm1(np.clip(values, -20, 20))
 
 
 def _rank_percentile(values: np.ndarray) -> np.ndarray:
@@ -85,141 +110,88 @@ class BaseUpliftModel(ABC):
         return pd.Series(dtype=float)
 
 
-class TwoModelsLearner(BaseUpliftModel):
-    """T-learner: separate outcome models for treatment and control."""
+class TwoModelRegressor(BaseUpliftModel):
+    """T-learner: separate log-spend regressors for treatment and control."""
 
-    name = "two_models"
+    name = "t_learner_log"
 
     def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
         self.params = params
         self.seed_offset = seed_offset
-        self.model_t_: lgb.LGBMClassifier | None = None
-        self.model_c_: lgb.LGBMClassifier | None = None
+        self.model_t_: lgb.LGBMRegressor | None = None
+        self.model_c_: lgb.LGBMRegressor | None = None
 
-    def fit(self, X, y, treatment, *, eval_set=None) -> TwoModelsLearner:
-        X = X.reset_index(drop=True)
-        y = np.asarray(y)
-        treatment = np.asarray(treatment)
-
+    def fit(self, X, y, treatment, *, eval_set=None) -> TwoModelRegressor:
+        y_log = np.log1p(np.asarray(y, dtype=float))
+        treatment = np.asarray(treatment, dtype=np.int8)
         mask_t = treatment == 1
-        mask_c = ~mask_t
+        mask_c = treatment == 0
 
-        self.model_t_ = _make_lgbm_classifier(self.params, self.seed_offset + 1)
-        self.model_c_ = _make_lgbm_classifier(self.params, self.seed_offset + 2)
+        self.model_t_ = _make_regressor(self.params, self.seed_offset + 1)
+        self.model_c_ = _make_regressor(self.params, self.seed_offset + 2)
 
-        fit_kwargs_t: dict = {}
-        fit_kwargs_c: dict = {}
-
+        eval_t = eval_c = None
         if eval_set is not None:
             X_val, y_val, t_val = eval_set
-            fit_kwargs_t["eval_set"] = [(X_val[t_val == 1], y_val[t_val == 1])]
-            fit_kwargs_c["eval_set"] = [(X_val[t_val == 0], y_val[t_val == 0])]
-            rounds = self.params.early_stopping_rounds
-            fit_kwargs_t["callbacks"] = [lgb.early_stopping(rounds, verbose=False)]
-            fit_kwargs_c["callbacks"] = [lgb.early_stopping(rounds, verbose=False)]
+            y_val_log = np.log1p(np.asarray(y_val, dtype=float))
+            eval_t = (X_val[t_val == 1], y_val_log[t_val == 1])
+            eval_c = (X_val[t_val == 0], y_val_log[t_val == 0])
 
-        self.model_t_.fit(X[mask_t], y[mask_t], **fit_kwargs_t)
-        self.model_c_.fit(X[mask_c], y[mask_c], **fit_kwargs_c)
+        _fit_regressor(self.model_t_, X[mask_t], y_log[mask_t], self.params, eval_set=eval_t)
+        _fit_regressor(self.model_c_, X[mask_c], y_log[mask_c], self.params, eval_set=eval_c)
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         assert self.model_t_ is not None and self.model_c_ is not None
-        p1 = self.model_t_.predict_proba(X)[:, 1]
-        p0 = self.model_c_.predict_proba(X)[:, 1]
-        return p1 - p0
+        return _safe_expm1(self.model_t_.predict(X)) - _safe_expm1(self.model_c_.predict(X))
 
     def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.model_t_ and self.model_c_
+        assert self.model_t_ is not None and self.model_c_ is not None
         imp = (self.model_t_.feature_importances_ + self.model_c_.feature_importances_) / 2
         return pd.Series(imp, index=feature_names).sort_values(ascending=False)
 
 
-class ClassTransformationLearner(BaseUpliftModel):
-    """Class transformation learner."""
+class SoloRegressor(BaseUpliftModel):
+    """S-learner: one log-spend model with treatment as a feature."""
 
-    name = "class_transformation"
-
-    def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
-        self.params = params
-        self.seed_offset = seed_offset
-        self.model_: lgb.LGBMClassifier | None = None
-
-    @staticmethod
-    def _transform_target(y: np.ndarray, treatment: np.ndarray) -> np.ndarray:
-        return np.where((treatment == 1) & (y == 1), 1, np.where((treatment == 0) & (y == 0), 1, 0))
-
-    def fit(self, X, y, treatment, *, eval_set=None) -> ClassTransformationLearner:
-        y = np.asarray(y)
-        treatment = np.asarray(treatment)
-        z = self._transform_target(y, treatment)
-
-        self.model_ = _make_lgbm_classifier(self.params, self.seed_offset + 3)
-        fit_kwargs: dict = {}
-        if eval_set is not None:
-            X_val, y_val, t_val = eval_set
-            z_val = self._transform_target(np.asarray(y_val), np.asarray(t_val))
-            fit_kwargs["eval_set"] = [(X_val, z_val)]
-            fit_kwargs["callbacks"] = [
-                lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)
-            ]
-
-        self.model_.fit(X, z, **fit_kwargs)
-        return self
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        assert self.model_ is not None
-        return 2.0 * self.model_.predict_proba(X)[:, 1] - 1.0
-
-    def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.model_
-        return pd.Series(self.model_.feature_importances_, index=feature_names).sort_values(
-            ascending=False
-        )
-
-
-class SoloModelLearner(BaseUpliftModel):
-    """S-learner: one response model with treatment as a feature."""
-
-    name = "solo_model"
+    name = "s_learner_log"
 
     def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
         self.params = params
         self.seed_offset = seed_offset
-        self.model_: lgb.LGBMClassifier | None = None
+        self.model_: lgb.LGBMRegressor | None = None
 
-    def fit(self, X, y, treatment, *, eval_set=None) -> SoloModelLearner:
+    def fit(self, X, y, treatment, *, eval_set=None) -> SoloRegressor:
         X_aug = X.copy()
         X_aug["treatment_flg"] = treatment
-        self.model_ = _make_lgbm_classifier(self.params, self.seed_offset + 4)
+        y_log = np.log1p(np.asarray(y, dtype=float))
+        self.model_ = _make_regressor(self.params, self.seed_offset + 3)
 
-        fit_kwargs: dict = {}
+        eval_reg = None
         if eval_set is not None:
             X_val, y_val, t_val = eval_set
             Xv = X_val.copy()
             Xv["treatment_flg"] = t_val
-            fit_kwargs["eval_set"] = [(Xv, y_val)]
-            fit_kwargs["callbacks"] = [
-                lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)
-            ]
+            eval_reg = (Xv, np.log1p(np.asarray(y_val, dtype=float)))
 
-        self.model_.fit(X_aug, y, **fit_kwargs)
+        _fit_regressor(self.model_, X_aug, y_log, self.params, eval_set=eval_reg)
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        assert self.model_
+        assert self.model_ is not None
         X1 = X.copy()
-        X1["treatment_flg"] = 1
         X0 = X.copy()
+        X1["treatment_flg"] = 1
         X0["treatment_flg"] = 0
-        return self.model_.predict_proba(X1)[:, 1] - self.model_.predict_proba(X0)[:, 1]
+        return _safe_expm1(self.model_.predict(X1)) - _safe_expm1(self.model_.predict(X0))
 
     def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.model_
+        assert self.model_ is not None
         imp = pd.Series(self.model_.feature_importances_, index=feature_names + ["treatment_flg"])
         return imp.drop(index="treatment_flg", errors="ignore").sort_values(ascending=False)
 
 
-class TransformedOutcomeLearner(BaseUpliftModel):
+class TransformedOutcomeRegressor(BaseUpliftModel):
     """Transformed outcome learner for randomized experiments."""
 
     name = "transformed_outcome"
@@ -232,26 +204,27 @@ class TransformedOutcomeLearner(BaseUpliftModel):
 
     @staticmethod
     def _target(y: np.ndarray, treatment: np.ndarray, propensity: float) -> np.ndarray:
-        propensity = float(np.clip(propensity, 1e-3, 1 - 1e-3))
-        return y * (treatment / propensity - (1 - treatment) / (1 - propensity))
+        p = float(np.clip(propensity, 1e-3, 1 - 1e-3))
+        return y * (treatment / p - (1.0 - treatment) / (1.0 - p))
 
-    def fit(self, X, y, treatment, *, eval_set=None) -> TransformedOutcomeLearner:
+    def fit(self, X, y, treatment, *, eval_set=None) -> TransformedOutcomeRegressor:
         y = np.asarray(y, dtype=float)
         treatment = np.asarray(treatment, dtype=float)
         self.propensity_ = float(treatment.mean())
         z = self._target(y, treatment, self.propensity_)
-        self.model_ = _make_lgbm_regressor(self.params, self.seed_offset + 5)
+        self.model_ = _make_regressor(self.params, self.seed_offset + 4)
 
-        fit_kwargs: dict = {}
+        eval_reg = None
         if eval_set is not None:
             X_val, y_val, t_val = eval_set
-            z_val = self._target(np.asarray(y_val, dtype=float), np.asarray(t_val, dtype=float), self.propensity_)
-            fit_kwargs["eval_set"] = [(X_val, z_val)]
-            fit_kwargs["callbacks"] = [
-                lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)
-            ]
+            z_val = self._target(
+                np.asarray(y_val, dtype=float),
+                np.asarray(t_val, dtype=float),
+                self.propensity_,
+            )
+            eval_reg = (X_val, z_val)
 
-        self.model_.fit(X, z, **fit_kwargs)
+        _fit_regressor(self.model_, X, z, self.params, eval_set=eval_reg)
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -259,153 +232,128 @@ class TransformedOutcomeLearner(BaseUpliftModel):
         return self.model_.predict(X)
 
     def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.model_
-        return pd.Series(self.model_.feature_importances_, index=feature_names).sort_values(
-            ascending=False
-        )
+        assert self.model_ is not None
+        return pd.Series(self.model_.feature_importances_, index=feature_names).sort_values(ascending=False)
 
 
-class XLearner(BaseUpliftModel):
-    """X-learner with LightGBM outcome and treatment-effect models."""
+class HurdleTwoModelRegressor(BaseUpliftModel):
+    """T-learner with purchase probability and positive-spend amount models."""
 
-    name = "x_learner"
+    name = "hurdle_t_learner"
 
     def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
         self.params = params
         self.seed_offset = seed_offset
-        self.mu_t_: lgb.LGBMClassifier | None = None
-        self.mu_c_: lgb.LGBMClassifier | None = None
-        self.tau_t_: lgb.LGBMRegressor | None = None
-        self.tau_c_: lgb.LGBMRegressor | None = None
-        self.propensity_: float = 0.5
+        self.clf_t_: lgb.LGBMClassifier | None = None
+        self.clf_c_: lgb.LGBMClassifier | None = None
+        self.reg_t_: lgb.LGBMRegressor | None = None
+        self.reg_c_: lgb.LGBMRegressor | None = None
+        self.mean_pos_t_: float = 0.0
+        self.mean_pos_c_: float = 0.0
 
-    def fit(self, X, y, treatment, *, eval_set=None) -> XLearner:
-        X = X.reset_index(drop=True)
+    def fit(self, X, y, treatment, *, eval_set=None) -> HurdleTwoModelRegressor:
         y = np.asarray(y, dtype=float)
-        treatment = np.asarray(treatment)
-        self.propensity_ = float(treatment.mean())
-
+        treatment = np.asarray(treatment, dtype=np.int8)
+        positive = (y > 0).astype(np.int8)
         mask_t = treatment == 1
-        mask_c = ~mask_t
+        mask_c = treatment == 0
 
-        self.mu_t_ = _make_lgbm_classifier(self.params, self.seed_offset + 11)
-        self.mu_c_ = _make_lgbm_classifier(self.params, self.seed_offset + 12)
-        fit_kwargs_t: dict = {}
-        fit_kwargs_c: dict = {}
+        self.clf_t_ = _make_classifier(self.params, self.seed_offset + 11)
+        self.clf_c_ = _make_classifier(self.params, self.seed_offset + 12)
+        self.reg_t_ = _make_regressor(self.params, self.seed_offset + 13)
+        self.reg_c_ = _make_regressor(self.params, self.seed_offset + 14)
+
+        eval_clf_t = eval_clf_c = eval_reg_t = eval_reg_c = None
         if eval_set is not None:
             X_val, y_val, t_val = eval_set
-            fit_kwargs_t["eval_set"] = [(X_val[t_val == 1], y_val[t_val == 1])]
-            fit_kwargs_c["eval_set"] = [(X_val[t_val == 0], y_val[t_val == 0])]
-            rounds = self.params.early_stopping_rounds
-            fit_kwargs_t["callbacks"] = [lgb.early_stopping(rounds, verbose=False)]
-            fit_kwargs_c["callbacks"] = [lgb.early_stopping(rounds, verbose=False)]
+            y_val = np.asarray(y_val, dtype=float)
+            pos_val = (y_val > 0).astype(np.int8)
+            eval_clf_t = (X_val[t_val == 1], pos_val[t_val == 1])
+            eval_clf_c = (X_val[t_val == 0], pos_val[t_val == 0])
+            eval_reg_t = (X_val[(t_val == 1) & (y_val > 0)], np.log1p(y_val[(t_val == 1) & (y_val > 0)]))
+            eval_reg_c = (X_val[(t_val == 0) & (y_val > 0)], np.log1p(y_val[(t_val == 0) & (y_val > 0)]))
 
-        self.mu_t_.fit(X[mask_t], y[mask_t], **fit_kwargs_t)
-        self.mu_c_.fit(X[mask_c], y[mask_c], **fit_kwargs_c)
+        _fit_classifier(self.clf_t_, X[mask_t], positive[mask_t], self.params, eval_set=eval_clf_t)
+        _fit_classifier(self.clf_c_, X[mask_c], positive[mask_c], self.params, eval_set=eval_clf_c)
 
-        d_t = y[mask_t] - self.mu_c_.predict_proba(X[mask_t])[:, 1]
-        d_c = self.mu_t_.predict_proba(X[mask_c])[:, 1] - y[mask_c]
+        pos_t = mask_t & (y > 0)
+        pos_c = mask_c & (y > 0)
+        self.mean_pos_t_ = float(y[pos_t].mean()) if pos_t.any() else 0.0
+        self.mean_pos_c_ = float(y[pos_c].mean()) if pos_c.any() else 0.0
 
-        self.tau_t_ = _make_lgbm_regressor(self.params, self.seed_offset + 13)
-        self.tau_c_ = _make_lgbm_regressor(self.params, self.seed_offset + 14)
-
-        reg_kwargs_t: dict = {}
-        reg_kwargs_c: dict = {}
-        if eval_set is not None:
-            X_val, y_val, t_val = eval_set
-            v_t = t_val == 1
-            v_c = t_val == 0
-            if v_t.any():
-                d_val_t = y_val[v_t] - self.mu_c_.predict_proba(X_val[v_t])[:, 1]
-                reg_kwargs_t["eval_set"] = [(X_val[v_t], d_val_t)]
-                reg_kwargs_t["callbacks"] = [lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)]
-            if v_c.any():
-                d_val_c = self.mu_t_.predict_proba(X_val[v_c])[:, 1] - y_val[v_c]
-                reg_kwargs_c["eval_set"] = [(X_val[v_c], d_val_c)]
-                reg_kwargs_c["callbacks"] = [lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)]
-
-        self.tau_t_.fit(X[mask_t], d_t, **reg_kwargs_t)
-        self.tau_c_.fit(X[mask_c], d_c, **reg_kwargs_c)
+        if pos_t.any():
+            _fit_regressor(self.reg_t_, X[pos_t], np.log1p(y[pos_t]), self.params, eval_set=eval_reg_t)
+        if pos_c.any():
+            _fit_regressor(self.reg_c_, X[pos_c], np.log1p(y[pos_c]), self.params, eval_set=eval_reg_c)
         return self
 
+    def _expected(self, X: pd.DataFrame, group: str) -> np.ndarray:
+        if group == "t":
+            assert self.clf_t_ is not None and self.reg_t_ is not None
+            p = self.clf_t_.predict_proba(X)[:, 1]
+            amount = _safe_expm1(self.reg_t_.predict(X)) if hasattr(self.reg_t_, "booster_") else self.mean_pos_t_
+        else:
+            assert self.clf_c_ is not None and self.reg_c_ is not None
+            p = self.clf_c_.predict_proba(X)[:, 1]
+            amount = _safe_expm1(self.reg_c_.predict(X)) if hasattr(self.reg_c_, "booster_") else self.mean_pos_c_
+        return p * amount
+
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        assert self.tau_t_ is not None and self.tau_c_ is not None
-        tau_t = self.tau_t_.predict(X)
-        tau_c = self.tau_c_.predict(X)
-        p = np.clip(self.propensity_, 1e-3, 1 - 1e-3)
-        return (1.0 - p) * tau_t + p * tau_c
+        return self._expected(X, "t") - self._expected(X, "c")
 
     def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.mu_t_ and self.mu_c_ and self.tau_t_ and self.tau_c_
-        imp = (
-            self.mu_t_.feature_importances_
-            + self.mu_c_.feature_importances_
-            + self.tau_t_.feature_importances_
-            + self.tau_c_.feature_importances_
-        ) / 4
-        return pd.Series(imp, index=feature_names).sort_values(ascending=False)
+        imps = []
+        for model in (self.clf_t_, self.clf_c_, self.reg_t_, self.reg_c_):
+            if model is not None and hasattr(model, "feature_importances_"):
+                imps.append(model.feature_importances_)
+        if not imps:
+            return pd.Series(dtype=float)
+        return pd.Series(np.mean(imps, axis=0), index=feature_names).sort_values(ascending=False)
 
 
 class RLearner(BaseUpliftModel):
-    """R-learner: residualized outcome model with constant randomized propensity."""
+    """R-learner with constant randomized propensity."""
 
     name = "r_learner"
 
     def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
         self.params = params
         self.seed_offset = seed_offset
-        self.mu_: lgb.LGBMClassifier | None = None
+        self.mu_: lgb.LGBMRegressor | None = None
         self.tau_: lgb.LGBMRegressor | None = None
         self.propensity_: float = 0.5
-
-    @staticmethod
-    def _pseudo_outcome(
-        y: np.ndarray,
-        treatment: np.ndarray,
-        mu: np.ndarray,
-        propensity: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        p = float(np.clip(propensity, 1e-3, 1 - 1e-3))
-        w = treatment.astype(float) - p
-        z = (y.astype(float) - mu) / np.where(np.abs(w) < 1e-3, np.sign(w) * 1e-3, w)
-        sample_weight = w ** 2
-        return z, sample_weight
 
     def fit(self, X, y, treatment, *, eval_set=None) -> RLearner:
         y = np.asarray(y, dtype=float)
         treatment = np.asarray(treatment, dtype=float)
         self.propensity_ = float(treatment.mean())
 
-        self.mu_ = _make_lgbm_classifier(self.params, self.seed_offset + 21)
-        fit_kwargs: dict = {}
+        self.mu_ = _make_regressor(self.params, self.seed_offset + 21)
+        eval_mu = None
         if eval_set is not None:
             X_val, y_val, _ = eval_set
-            fit_kwargs["eval_set"] = [(X_val, y_val)]
-            fit_kwargs["callbacks"] = [
-                lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)
-            ]
-        self.mu_.fit(X, y, **fit_kwargs)
+            eval_mu = (X_val, np.asarray(y_val, dtype=float))
+        _fit_regressor(self.mu_, X, y, self.params, eval_set=eval_mu)
 
-        mu_fit = self.mu_.predict_proba(X)[:, 1]
-        z_fit, w_fit = self._pseudo_outcome(y, treatment, mu_fit, self.propensity_)
+        mu_fit = self.mu_.predict(X)
+        w = treatment - self.propensity_
+        denom = np.where(np.abs(w) < 1e-3, np.sign(w + 1e-9) * 1e-3, w)
+        z = (y - mu_fit) / denom
+        sample_weight = w ** 2
 
-        self.tau_ = _make_lgbm_regressor(self.params, self.seed_offset + 22)
-        reg_kwargs: dict = {}
+        self.tau_ = _make_regressor(self.params, self.seed_offset + 22)
+        eval_tau = eval_w = None
         if eval_set is not None:
             X_val, y_val, t_val = eval_set
-            mu_val = self.mu_.predict_proba(X_val)[:, 1]
-            z_val, w_val = self._pseudo_outcome(
-                np.asarray(y_val, dtype=float),
-                np.asarray(t_val, dtype=float),
-                mu_val,
-                self.propensity_,
-            )
-            reg_kwargs["eval_set"] = [(X_val, z_val)]
-            reg_kwargs["eval_sample_weight"] = [w_val]
-            reg_kwargs["callbacks"] = [
-                lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)
-            ]
-        self.tau_.fit(X, z_fit, sample_weight=w_fit, **reg_kwargs)
+            t_val = np.asarray(t_val, dtype=float)
+            mu_val = self.mu_.predict(X_val)
+            w_val = t_val - self.propensity_
+            denom_val = np.where(np.abs(w_val) < 1e-3, np.sign(w_val + 1e-9) * 1e-3, w_val)
+            eval_tau = (X_val, (np.asarray(y_val, dtype=float) - mu_val) / denom_val)
+            eval_w = w_val ** 2
+        _fit_regressor(self.tau_, X, z, self.params, eval_set=eval_tau, sample_weight=sample_weight)
+        if eval_w is not None:
+            pass
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -413,106 +361,13 @@ class RLearner(BaseUpliftModel):
         return self.tau_.predict(X)
 
     def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.mu_ and self.tau_
+        assert self.mu_ is not None and self.tau_ is not None
         imp = (self.mu_.feature_importances_ + self.tau_.feature_importances_) / 2
         return pd.Series(imp, index=feature_names).sort_values(ascending=False)
 
 
-class DRLearner(BaseUpliftModel):
-    """Doubly robust learner: T-learner nuisance models plus pseudo-outcome regression."""
-
-    name = "dr_learner"
-
-    def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
-        self.params = params
-        self.seed_offset = seed_offset
-        self.mu_t_: lgb.LGBMClassifier | None = None
-        self.mu_c_: lgb.LGBMClassifier | None = None
-        self.tau_: lgb.LGBMRegressor | None = None
-        self.propensity_: float = 0.5
-
-    @staticmethod
-    def _pseudo_outcome(
-        y: np.ndarray,
-        treatment: np.ndarray,
-        mu_t: np.ndarray,
-        mu_c: np.ndarray,
-        propensity: float,
-    ) -> np.ndarray:
-        p = float(np.clip(propensity, 1e-3, 1 - 1e-3))
-        t = treatment.astype(float)
-        return (
-            mu_t
-            - mu_c
-            + t / p * (y.astype(float) - mu_t)
-            - (1.0 - t) / (1.0 - p) * (y.astype(float) - mu_c)
-        )
-
-    def fit(self, X, y, treatment, *, eval_set=None) -> DRLearner:
-        X = X.reset_index(drop=True)
-        y = np.asarray(y, dtype=float)
-        treatment = np.asarray(treatment)
-        self.propensity_ = float(treatment.mean())
-
-        mask_t = treatment == 1
-        mask_c = ~mask_t
-        self.mu_t_ = _make_lgbm_classifier(self.params, self.seed_offset + 31)
-        self.mu_c_ = _make_lgbm_classifier(self.params, self.seed_offset + 32)
-
-        fit_kwargs_t: dict = {}
-        fit_kwargs_c: dict = {}
-        if eval_set is not None:
-            X_val, y_val, t_val = eval_set
-            fit_kwargs_t["eval_set"] = [(X_val[t_val == 1], y_val[t_val == 1])]
-            fit_kwargs_c["eval_set"] = [(X_val[t_val == 0], y_val[t_val == 0])]
-            rounds = self.params.early_stopping_rounds
-            fit_kwargs_t["callbacks"] = [lgb.early_stopping(rounds, verbose=False)]
-            fit_kwargs_c["callbacks"] = [lgb.early_stopping(rounds, verbose=False)]
-
-        self.mu_t_.fit(X[mask_t], y[mask_t], **fit_kwargs_t)
-        self.mu_c_.fit(X[mask_c], y[mask_c], **fit_kwargs_c)
-
-        mu_t_fit = self.mu_t_.predict_proba(X)[:, 1]
-        mu_c_fit = self.mu_c_.predict_proba(X)[:, 1]
-        z_fit = self._pseudo_outcome(y, treatment.astype(float), mu_t_fit, mu_c_fit, self.propensity_)
-
-        self.tau_ = _make_lgbm_regressor(self.params, self.seed_offset + 33)
-        reg_kwargs: dict = {}
-        if eval_set is not None:
-            X_val, y_val, t_val = eval_set
-            mu_t_val = self.mu_t_.predict_proba(X_val)[:, 1]
-            mu_c_val = self.mu_c_.predict_proba(X_val)[:, 1]
-            z_val = self._pseudo_outcome(
-                np.asarray(y_val, dtype=float),
-                np.asarray(t_val, dtype=float),
-                mu_t_val,
-                mu_c_val,
-                self.propensity_,
-            )
-            reg_kwargs["eval_set"] = [(X_val, z_val)]
-            reg_kwargs["callbacks"] = [
-                lgb.early_stopping(self.params.early_stopping_rounds, verbose=False)
-            ]
-
-        self.tau_.fit(X, z_fit, **reg_kwargs)
-        return self
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        assert self.tau_ is not None
-        return self.tau_.predict(X)
-
-    def feature_importances_(self, feature_names: list[str]) -> pd.Series:
-        assert self.mu_t_ and self.mu_c_ and self.tau_
-        imp = (
-            self.mu_t_.feature_importances_
-            + self.mu_c_.feature_importances_
-            + self.tau_.feature_importances_
-        ) / 3
-        return pd.Series(imp, index=feature_names).sort_values(ascending=False)
-
-
 class EnsembleUpliftModel(BaseUpliftModel):
-    """Weighted ensemble. Rank mode optimizes ordering stability for AUUC/Qini submissions."""
+    """Weighted ensemble. Rank mode focuses on stable ordering for uplift@10."""
 
     name = "ensemble"
 
@@ -524,18 +379,20 @@ class EnsembleUpliftModel(BaseUpliftModel):
         rank_average: bool = False,
     ) -> None:
         self.models = models
-        w = np.asarray(weights, dtype=float)
-        self.weights = w / w.sum()
+        weights_arr = np.asarray(weights, dtype=float)
+        if weights_arr.sum() <= 0:
+            weights_arr = np.ones(len(models), dtype=float)
+        self.weights = weights_arr / weights_arr.sum()
         self.rank_average = rank_average
         self.sub_names = [m.name for m in models]
 
     def fit(self, X, y, treatment, *, eval_set=None) -> EnsembleUpliftModel:
-        for m in self.models:
-            m.fit(X, y, treatment, eval_set=eval_set)
+        for model in self.models:
+            model.fit(X, y, treatment, eval_set=eval_set)
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        preds = np.column_stack([m.predict(X) for m in self.models])
+        preds = np.column_stack([model.predict(X) for model in self.models])
         if self.rank_average:
             preds = np.column_stack([_rank_percentile(preds[:, i]) for i in range(preds.shape[1])])
         return preds @ self.weights
@@ -543,20 +400,16 @@ class EnsembleUpliftModel(BaseUpliftModel):
 
 def create_model(name: ModelName, params: LGBMParams) -> BaseUpliftModel:
     base_name, seed_offset = _parse_model_name(name)
-    if base_name == "two_models":
-        model = TwoModelsLearner(params, seed_offset)
-    elif base_name == "class_transformation":
-        model = ClassTransformationLearner(params, seed_offset)
-    elif base_name == "solo_model":
-        model = SoloModelLearner(params, seed_offset)
+    if base_name == "t_learner_log":
+        model = TwoModelRegressor(params, seed_offset)
+    elif base_name == "s_learner_log":
+        model = SoloRegressor(params, seed_offset)
     elif base_name == "transformed_outcome":
-        model = TransformedOutcomeLearner(params, seed_offset)
-    elif base_name == "x_learner":
-        model = XLearner(params, seed_offset)
+        model = TransformedOutcomeRegressor(params, seed_offset)
+    elif base_name == "hurdle_t_learner":
+        model = HurdleTwoModelRegressor(params, seed_offset)
     elif base_name == "r_learner":
         model = RLearner(params, seed_offset)
-    elif base_name == "dr_learner":
-        model = DRLearner(params, seed_offset)
     else:
         raise ValueError(f"Unknown model: {name}")
     model.name = name
@@ -564,16 +417,11 @@ def create_model(name: ModelName, params: LGBMParams) -> BaseUpliftModel:
 
 
 ALL_MODELS: tuple[ModelName, ...] = (
-    "two_models",
-    "class_transformation",
-    "solo_model",
+    "hurdle_t_learner",
+    "t_learner_log",
+    "s_learner_log",
     "transformed_outcome",
-    "x_learner",
     "r_learner",
-    "dr_learner",
-    "two_models_s101",
-    "class_transformation_s101",
-    "class_transformation_s202",
-    "transformed_outcome_s101",
-    "dr_learner_s101",
+    "hurdle_t_learner_s101",
+    "t_learner_log_s101",
 )

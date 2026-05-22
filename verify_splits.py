@@ -1,46 +1,46 @@
-"""Check CV and early-stopping split stratification."""
+"""Quick check for CV and early-stopping split stratification."""
 
-import pandas as pd
-from sklearn.model_selection import StratifiedKFold
+from __future__ import annotations
 
-from evaluation import stratified_holdout_split
+import argparse
+from pathlib import Path
 
-train = pd.read_csv("dataset/uplift_train.csv")
-t = train.treatment_flg.values
-y = train.target.values
-strata = t * 2 + y
+import numpy as np
 
-global_treatment_rate = t.mean()
-global_target_rate = y.mean()
+from data import TARGET_COL, TREATMENT_COL, load_and_validate
+from evaluation import make_strata, stratified_holdout_split
 
-skf = StratifiedKFold(5, shuffle=True, random_state=42)
-print(f"Global treatment rate: {global_treatment_rate:.6f}")
-print(f"Global target rate:    {global_target_rate:.6f}\n")
 
-for fold, (tr_idx, oof_idx) in enumerate(skf.split(train, strata), 1):
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=Path, default=Path("dataset"))
+    parser.add_argument("--train", type=Path, default=None)
+    parser.add_argument("--test", type=Path, default=None)
+    parser.add_argument("--folds", type=int, default=5)
+    args = parser.parse_args()
+
+    train, _, _ = load_and_validate(args.dataset, train_path=args.train, test_path=args.test)
+    treatment = train[TREATMENT_COL].to_numpy()
+    y = train[TARGET_COL].to_numpy(dtype=float)
+    strata = make_strata(treatment, y)
+
+    print(f"Rows: {len(train):,}")
+    print(f"Treatment rate: {treatment.mean():.6f}")
+    print(f"Positive rec_spend rate: {(y > 0).mean():.6f}")
+    print(f"Strata counts: {dict(zip(*np.unique(strata, return_counts=True)))}")
+
+    indices = np.arange(len(train))
     fit_idx, es_idx = stratified_holdout_split(
-        tr_idx,
-        t,
+        indices,
+        treatment,
         y,
         val_fraction=0.2,
-        random_state=42 + fold,
+        random_state=42,
     )
+    print(f"Fit rows: {len(fit_idx):,}; early-stop rows: {len(es_idx):,}")
+    print(f"Fit treatment rate: {treatment[fit_idx].mean():.6f}")
+    print(f"Early-stop treatment rate: {treatment[es_idx].mean():.6f}")
 
-    r_oof = t[oof_idx].mean()
-    r_fit = t[fit_idx].mean()
-    r_es = t[es_idx].mean()
-    y_oof = y[oof_idx].mean()
-    y_fit = y[fit_idx].mean()
-    y_es = y[es_idx].mean()
 
-    print(
-        f"Fold {fold}: treatment oof={r_oof:.5f}  fit={r_fit:.5f}  early_stop={r_es:.5f}  "
-        f"(max |delta|={max(abs(r_oof-global_treatment_rate), abs(r_fit-global_treatment_rate), abs(r_es-global_treatment_rate)):.5f})"
-    )
-    print(
-        f"         target    oof={y_oof:.5f}  fit={y_fit:.5f}  early_stop={y_es:.5f}  "
-        f"(max |delta|={max(abs(y_oof-global_target_rate), abs(y_fit-global_target_rate), abs(y_es-global_target_rate)):.5f})"
-    )
-    print(f"         n_fit={len(fit_idx):,}  n_es={len(es_idx):,}  n_oof={len(oof_idx):,}")
-
-print("\nOK: early_stop is separate from oof_val; stratify=treatment+target at each level.")
+if __name__ == "__main__":
+    main()

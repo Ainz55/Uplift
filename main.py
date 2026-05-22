@@ -21,6 +21,10 @@ import sys
 import warnings
 from pathlib import Path
 
+from runtime_env import configure_runtime_storage
+
+configure_runtime_storage()
+
 import numpy as np
 import pandas as pd
 
@@ -28,7 +32,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from config import PipelineConfig
 from console_report import print_full_report
-from data import DatasetError, load_and_validate
+from data import ID_COL, TARGET_COL, TREATMENT_COL, DatasetError, load_and_validate
 from evaluation import select_best_model, train_final_model
 from features import prepare_datasets
 from metrics import evaluate_all_metrics
@@ -52,10 +56,10 @@ logger = logging.getLogger("uplift")
 
 
 def save_reports(
-    cfg: PipelineConfig,
-    eval_report,
-    oof_metrics: dict[str, float],
-    cv_tables: dict[str, pd.DataFrame],
+        cfg: PipelineConfig,
+        eval_report,
+        oof_metrics: dict[str, float],
+        cv_tables: dict[str, pd.DataFrame],
 ) -> None:
     """
     Сохранение метрик в JSON и таблиц кросс-валидации в CSV.
@@ -70,12 +74,12 @@ def save_reports(
     """
 
     cfg.ensure_dirs()
-
     summary = {
         "best_model": eval_report.best_model_name,
+        "selection_metric": f"uplift_at_{int(round(cfg.top_k * 100))}pct_ci_lower",
         "oof_metrics": oof_metrics,
         "models_cv_summary": {
-            name: {k: float(v) for k, v in cv.summary.items() if k != "weights"}
+            name: {k: v for k, v in cv.summary.items() if k != "weights"}
             for name, cv in eval_report.all_results.items()
         },
     }
@@ -88,7 +92,7 @@ def save_reports(
     for name, fold_df in cv_tables.items():
         fold_df.to_csv(cfg.output_dir / f"cv_{name}.csv", index=False)
 
-    logger.info("JSON/CSV отчёты сохранены: %s", cfg.output_dir)
+    logger.info("Reports saved to %s", cfg.output_dir)
 
 
 def run(cfg: PipelineConfig) -> None:
@@ -103,80 +107,88 @@ def run(cfg: PipelineConfig) -> None:
     6. Генерация отчётов, графиков и submission.csv
     """
     cfg.ensure_dirs()
-    logger.info("Загрузка данных из %s", cfg.dataset_dir)
+    logger.info("Loading train=%s", cfg.resolved_train_path())
+    logger.info("Loading test=%s", cfg.resolved_test_path())
 
     # 1. Загрузка данных
     try:
-        train, test, clients, info = load_and_validate(cfg.dataset_dir)
-    except DatasetError as e:
-        logger.error("Ошибка датасета: %s", e)
-        raise SystemExit(1) from e
+        train, test, info = load_and_validate(
+            cfg.dataset_dir,
+            train_path=cfg.train_path,
+            test_path=cfg.test_path,
+        )
+    except DatasetError as exc:
+        logger.error("Dataset error: %s", exc)
+        raise SystemExit(1) from exc
 
-    # 2. feature engineering
-    train_df, test_df, feature_cols = prepare_datasets(train, test, clients)
-
-    X = train_df[feature_cols]
-    y = train_df["target"].values.astype(np.int8)
-    treatment = train_df["treatment_flg"].values.astype(np.int8)
-    X_test = test_df[feature_cols]
+    X, X_test, feature_cols, _ = prepare_datasets(
+        train,
+        test,
+        max_categories=cfg.max_categories,
+    )
+    y = train[TARGET_COL].to_numpy(dtype=np.float32)
+    treatment = train[TREATMENT_COL].to_numpy(dtype=np.int8)
 
     # 3. Кросс-валидация и выбор модели
-    logger.info("Кросс-валидация — сравнение моделей...")
+    logger.info("Cross-validation and model selection...")
     eval_report = select_best_model(X, y, treatment, cfg)
 
     # 4. Расчёт метрик на oof-предсказаниях
     oof_metrics = evaluate_all_metrics(
-        y, eval_report.oof_uplift, treatment,
-        k=cfg.top_k, margin=cfg.margin, cost=cfg.treatment_cost,
+        y,
+        eval_report.oof_uplift,
+        treatment,
+        k=cfg.top_k,
         k_grid=cfg.uplift_k_grid,
+        bootstrap_iterations=cfg.bootstrap_iterations,
+        bootstrap_ci=cfg.bootstrap_ci,
+        random_state=cfg.random_state,
     )
 
     # 5. Сохранение отчётов
-    cv_tables = {
-        n: cv.fold_metrics
-        for n, cv in eval_report.all_results.items()
-        if n not in {"ensemble", "rank_ensemble", "top_ensemble", "rank_top_ensemble"}
-    }
+    cv_tables = {name: cv.fold_metrics for name, cv in eval_report.all_results.items()}
     save_reports(cfg, eval_report, oof_metrics, cv_tables)
 
     # 6. Обучение финальной модели на всех данных
-    logger.info("Обучение финальной модели: %s", eval_report.best_model_name)
+    logger.info("Training final model: %s", eval_report.best_model_name)
     weights = (
         eval_report.ensemble_weights
         if eval_report.best_model_name in {"ensemble", "rank_ensemble", "top_ensemble", "rank_top_ensemble"}
         else None
     )
     final_model = train_final_model(
-        eval_report.best_model_name, X, y, treatment, cfg, sub_weights=weights,
+        eval_report.best_model_name,
+        X,
+        y,
+        treatment,
+        cfg,
+        sub_weights=weights,
     )
 
     # 7. Извлечение важности признаков
     feature_importances = None
     if hasattr(final_model, "feature_importances_"):
         feature_importances = final_model.feature_importances_(feature_cols)
-    elif hasattr(final_model, "models"):
-        for sub in final_model.models:
-            if hasattr(sub, "feature_importances_"):
-                feature_importances = sub.feature_importances_(feature_cols)
+    if (feature_importances is None or not len(feature_importances)) and hasattr(final_model, "models"):
+        for sub_model in final_model.models:
+            if hasattr(sub_model, "feature_importances_"):
+                feature_importances = sub_model.feature_importances_(feature_cols)
                 break
 
     # 8. Построение графиков
-    logger.info("Построение графиков...")
+    logger.info("Generating validation plots...")
     generate_all_plots(eval_report, cfg, feature_importances=feature_importances)
 
     # 9. Предсказание на тестовой выборке
-    test_uplift = final_model.predict(X_test)
-    submission = pd.DataFrame({"client_id": test_df["client_id"], "uplift": test_uplift})
-
-    sample_path = cfg.dataset_dir / "uplift_sample_submission.csv"
-    if sample_path.exists():
-        sample = pd.read_csv(sample_path)
-        if "client_id" in sample.columns and set(sample["client_id"]) == set(submission["client_id"]):
-            submission = sample[["client_id"]].merge(submission, on="client_id", how="left", validate="one_to_one")
-        else:
-            logger.warning("Sample submission найден, но набор client_id не совпадает; сохраняем порядок uplift_test.csv")
-
-    submission.to_csv(cfg.submission_path, index=False)
+    test_uplift = np.asarray(final_model.predict(X_test), dtype=float)
+    test_uplift = np.nan_to_num(test_uplift, nan=0.0, posinf=0.0, neginf=0.0)
+    predictions = pd.DataFrame(
+        {
+            ID_COL: test[ID_COL].to_numpy(),
+            "UPLIFT_SCORE": test_uplift,
+        }
+    )
+    predictions.to_csv(cfg.predictions_path, index=False, encoding="utf-8")
 
     # 10. Формирование итогового отчёта в консоль
     print_full_report(
@@ -186,11 +198,32 @@ def run(cfg: PipelineConfig) -> None:
         report=eval_report,
         oof_metrics=oof_metrics,
         test_uplift=test_uplift,
-        submission_path=str(cfg.submission_path),
+        predictions_path=str(cfg.predictions_path),
     )
+    logger.info("Done.")
 
-    logger.info("Графики: %s", cfg.reports_dir)
-    logger.info("Готово.")
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Continuous uplift modeling for MAGNIT TECH case 2.",
+    )
+    parser.add_argument("--dataset", type=Path, default=None, help="Directory with train.parquet and test.parquet")
+    parser.add_argument("--train", type=Path, default=None, help="Explicit train file path")
+    parser.add_argument("--test", type=Path, default=None, help="Explicit test file path")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--reports-dir", type=Path, default=None)
+    parser.add_argument("--predictions", type=Path, default=None, help="Output predictions.csv path")
+    parser.add_argument("--folds", type=int, default=None)
+    parser.add_argument("--top-k", type=float, default=None)
+    parser.add_argument("--bootstrap-iterations", type=int, default=None)
+    parser.add_argument("--max-categories", type=int, default=None)
+    parser.add_argument(
+        "--models",
+        type=str,
+        default=None,
+        help="Comma-separated model names, e.g. hurdle_t_learner,t_learner_log",
+    )
+    return parser
 
 
 def main() -> None:
@@ -209,36 +242,33 @@ def main() -> None:
         --cost         Стоимость одного воздействия, руб. (для расчёта ROI)
     """
 
-    parser = argparse.ArgumentParser(
-        description="Uplift-моделирование · задача №2 (полное решение)",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        default=None,
-        help="Папка с uplift_train.csv, uplift_test.csv, clients.csv",
-    )
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--reports-dir", type=Path, default=None)
-    parser.add_argument("--folds", type=int, default=None)
-    parser.add_argument("--margin", type=float, default=None, help="Маржа с конверсии, руб.")
-    parser.add_argument("--cost", type=float, default=None, help="Стоимость воздействия, руб.")
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
 
     cfg = PipelineConfig()
     if args.dataset:
         cfg.dataset_dir = args.dataset
+    if args.train:
+        cfg.train_path = args.train
+    if args.test:
+        cfg.test_path = args.test
     if args.output_dir:
         cfg.output_dir = args.output_dir
-        cfg.submission_path = args.output_dir / "submission.csv"
     if args.reports_dir:
         cfg.reports_dir = args.reports_dir
+    if args.predictions:
+        cfg.predictions_path = args.predictions
+    elif args.output_dir:
+        cfg.predictions_path = args.output_dir / "predictions.csv"
     if args.folds is not None:
         cfg.n_folds = args.folds
-    if args.margin is not None:
-        cfg.margin = args.margin
-    if args.cost is not None:
-        cfg.treatment_cost = args.cost
+    if args.top_k is not None:
+        cfg.top_k = args.top_k
+    if args.bootstrap_iterations is not None:
+        cfg.bootstrap_iterations = args.bootstrap_iterations
+    if args.max_categories is not None:
+        cfg.max_categories = args.max_categories
+    if args.models:
+        cfg.model_names = tuple(name.strip() for name in args.models.split(",") if name.strip())
 
     run(cfg)
 
