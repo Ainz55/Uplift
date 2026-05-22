@@ -22,16 +22,16 @@ UPLIFT_K_GRID: tuple[float, ...] = (0.05, 0.10, 0.20, 0.30)
 
 @dataclass
 class LGBMParams:
-    n_estimators: int = 900
-    learning_rate: float = 0.035
+    n_estimators: int = 1200
+    learning_rate: float = 0.025
     max_depth: int = 7
     num_leaves: int = 63
-    min_child_samples: int = 80
+    min_child_samples: int = 60
     subsample: float = 0.85
     colsample_bytree: float = 0.85
     reg_alpha: float = 0.1
     reg_lambda: float = 1.0
-    early_stopping_rounds: int = 80
+    early_stopping_rounds: int = 100
     n_jobs: int = 4
 
 
@@ -51,6 +51,7 @@ class PipelineConfig:
     bootstrap_iterations: int = 200
     bootstrap_ci: float = 0.80
     max_categories: int = 40
+    feature_set: str = "baseline"
     model_names: tuple[str, ...] | None = None
     lgbm: LGBMParams = field(default_factory=LGBMParams)
 

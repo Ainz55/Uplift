@@ -48,9 +48,15 @@ def save_reports(
     cv_tables: dict[str, pd.DataFrame],
 ) -> None:
     cfg.ensure_dirs()
+    pct = int(round(cfg.top_k * 100))
+    leaderboard_key = f"uplift_at_{pct}pct_ci_lower"
     summary = {
         "best_model": eval_report.best_model_name,
-        "selection_metric": f"uplift_at_{int(round(cfg.top_k * 100))}pct_ci_lower",
+        "selection_metric": leaderboard_key,
+        "leaderboard_proxy": float(eval_report.best_cv.summary[leaderboard_key]),
+        "target_score": 20.00123,
+        "gap_vs_target": float(eval_report.best_cv.summary[leaderboard_key] - 20.00123),
+        "feature_set": cfg.feature_set,
         "oof_metrics": oof_metrics,
         "models_cv_summary": {
             name: {k: v for k, v in cv.summary.items() if k != "weights"}
@@ -88,6 +94,7 @@ def run(cfg: PipelineConfig) -> None:
         train,
         test,
         max_categories=cfg.max_categories,
+        feature_set=cfg.feature_set,
     )
     y = train[TARGET_COL].to_numpy(dtype=np.float32)
     treatment = train[TREATMENT_COL].to_numpy(dtype=np.int8)
@@ -172,6 +179,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-iterations", type=int, default=None)
     parser.add_argument("--max-categories", type=int, default=None)
     parser.add_argument(
+        "--feature-set",
+        choices=("baseline", "event_zero", "semantic", "enhanced"),
+        default=None,
+        help="baseline is the safer public-LB mode; event_zero only zero-fills event counters; semantic uses broader domain-aware imputations; enhanced adds experimental ratio/interactions",
+    )
+    parser.add_argument(
         "--models",
         type=str,
         default=None,
@@ -206,6 +219,8 @@ def main() -> None:
         cfg.bootstrap_iterations = args.bootstrap_iterations
     if args.max_categories is not None:
         cfg.max_categories = args.max_categories
+    if args.feature_set is not None:
+        cfg.feature_set = args.feature_set
     if args.models:
         cfg.model_names = tuple(name.strip() for name in args.models.split(",") if name.strip())
 
@@ -214,3 +229,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# --- Run commands ---
+# Best run v2 (new X-learner + hurdle variants, baseline features):
+# python main.py --dataset dataset --output-dir output/v2 --predictions output/v2/predictions.csv --folds 5 --models hurdle_t_learner_s101,hurdle_t_learner_s201,x_learner,x_learner_s101,hurdle_x_learner,hurdle_x_learner_s101
+#
+# Best run v2 with enhanced features (adds ratio/interaction features):
+# python main.py --dataset dataset --output-dir output/v2_enhanced --predictions output/v2_enhanced/predictions.csv --folds 5 --feature-set enhanced --models hurdle_t_learner_s101,x_learner,x_learner_s101,hurdle_x_learner,hurdle_x_learner_s101
+#
+# Quick probe (3 folds, 100 bootstrap, fast):
+# python main.py --dataset dataset --output-dir output/probe --predictions output/probe/predictions.csv --folds 3 --bootstrap-iterations 100 --models x_learner,hurdle_x_learner,hurdle_t_learner_s101

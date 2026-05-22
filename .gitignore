@@ -7,3 +7,10 @@ predictions.csv
 .tmp
 __pycache__
 .idea
+.claude
+Dockerfile
+predictions_baseline_17_92039.csv
+predictions_event_zero_candidate.csv
+predictions_hurdle.csv
+.dockerignore
+README.md

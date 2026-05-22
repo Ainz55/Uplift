@@ -366,6 +366,202 @@ class RLearner(BaseUpliftModel):
         return pd.Series(imp, index=feature_names).sort_values(ascending=False)
 
 
+class XLearner(BaseUpliftModel):
+    """X-learner meta-learner — more data-efficient CATE estimation in RCTs.
+
+    Stage 1: separate outcome models (T and C) on log1p scale.
+    Stage 2: imputed effect targets -> two CATE models.
+    Prediction: 0.5 * tau_t + 0.5 * tau_c  (propensity = 0.5 in balanced RCT).
+    """
+
+    name = "x_learner"
+
+    def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
+        self.params = params
+        self.seed_offset = seed_offset
+        self.mu_t_: lgb.LGBMRegressor | None = None
+        self.mu_c_: lgb.LGBMRegressor | None = None
+        self.tau_t_: lgb.LGBMRegressor | None = None
+        self.tau_c_: lgb.LGBMRegressor | None = None
+        self.propensity_: float = 0.5
+
+    def fit(self, X, y, treatment, *, eval_set=None) -> XLearner:
+        y = np.asarray(y, dtype=float)
+        y_log = np.log1p(np.clip(y, 0, None))
+        treatment = np.asarray(treatment, dtype=np.int8)
+        self.propensity_ = float(treatment.mean())
+        mask_t = treatment == 1
+        mask_c = treatment == 0
+
+        self.mu_t_ = _make_regressor(self.params, self.seed_offset + 31)
+        self.mu_c_ = _make_regressor(self.params, self.seed_offset + 32)
+
+        eval_t = eval_c = None
+        if eval_set is not None:
+            X_val, y_val, t_val = eval_set
+            y_val_log = np.log1p(np.clip(np.asarray(y_val, dtype=float), 0, None))
+            eval_t = (X_val[t_val == 1], y_val_log[t_val == 1])
+            eval_c = (X_val[t_val == 0], y_val_log[t_val == 0])
+
+        _fit_regressor(self.mu_t_, X[mask_t], y_log[mask_t], self.params, eval_set=eval_t)
+        _fit_regressor(self.mu_c_, X[mask_c], y_log[mask_c], self.params, eval_set=eval_c)
+
+        # Imputed effects in raw-spend scale
+        D_t = y[mask_t] - _safe_expm1(self.mu_c_.predict(X[mask_t]))
+        D_c = _safe_expm1(self.mu_t_.predict(X[mask_c])) - y[mask_c]
+
+        # Stage-2 CATE models — build eval sets from validation fold if available
+        eval_tau_t = eval_tau_c = None
+        if eval_set is not None:
+            X_val, y_val, t_val = eval_set
+            y_val = np.asarray(y_val, dtype=float)
+            mask_val_t = t_val == 1
+            mask_val_c = t_val == 0
+            if mask_val_t.any():
+                D_t_val = y_val[mask_val_t] - _safe_expm1(self.mu_c_.predict(X_val[mask_val_t]))
+                eval_tau_t = (X_val[mask_val_t], D_t_val)
+            if mask_val_c.any():
+                D_c_val = _safe_expm1(self.mu_t_.predict(X_val[mask_val_c])) - y_val[mask_val_c]
+                eval_tau_c = (X_val[mask_val_c], D_c_val)
+
+        self.tau_t_ = _make_regressor(self.params, self.seed_offset + 33)
+        self.tau_c_ = _make_regressor(self.params, self.seed_offset + 34)
+        _fit_regressor(self.tau_t_, X[mask_t], D_t, self.params, eval_set=eval_tau_t)
+        _fit_regressor(self.tau_c_, X[mask_c], D_c, self.params, eval_set=eval_tau_c)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        assert self.tau_t_ is not None and self.tau_c_ is not None
+        g = self.propensity_
+        return g * self.tau_c_.predict(X) + (1.0 - g) * self.tau_t_.predict(X)
+
+    def feature_importances_(self, feature_names: list[str]) -> pd.Series:
+        imps = [
+            m.feature_importances_
+            for m in (self.tau_t_, self.tau_c_)
+            if m is not None and hasattr(m, "feature_importances_")
+        ]
+        if not imps:
+            return pd.Series(dtype=float)
+        return pd.Series(np.mean(imps, axis=0), index=feature_names).sort_values(ascending=False)
+
+
+class HurdleXLearner(BaseUpliftModel):
+    """X-learner with hurdle (two-part) outcome models in stage 1.
+
+    Combines zero-inflation handling (hurdle) with the cross-prediction
+    efficiency of X-learner. Stage-1 expected spend = P(buy)*E[amount|buy].
+    Stage-2 imputed effects are then used to fit CATE models.
+    """
+
+    name = "hurdle_x_learner"
+
+    def __init__(self, params: LGBMParams, seed_offset: int = 0) -> None:
+        self.params = params
+        self.seed_offset = seed_offset
+        # Stage-1 hurdle components
+        self.clf_t_: lgb.LGBMClassifier | None = None
+        self.clf_c_: lgb.LGBMClassifier | None = None
+        self.reg_t_: lgb.LGBMRegressor | None = None
+        self.reg_c_: lgb.LGBMRegressor | None = None
+        self.mean_pos_t_: float = 0.0
+        self.mean_pos_c_: float = 0.0
+        # Stage-2 CATE models
+        self.tau_t_: lgb.LGBMRegressor | None = None
+        self.tau_c_: lgb.LGBMRegressor | None = None
+        self.propensity_: float = 0.5
+
+    def _expected_spend(self, X: pd.DataFrame, group: str) -> np.ndarray:
+        if group == "t":
+            p = self.clf_t_.predict_proba(X)[:, 1]
+            amt = (
+                _safe_expm1(self.reg_t_.predict(X))
+                if hasattr(self.reg_t_, "booster_")
+                else self.mean_pos_t_
+            )
+        else:
+            p = self.clf_c_.predict_proba(X)[:, 1]
+            amt = (
+                _safe_expm1(self.reg_c_.predict(X))
+                if hasattr(self.reg_c_, "booster_")
+                else self.mean_pos_c_
+            )
+        return p * amt
+
+    def fit(self, X, y, treatment, *, eval_set=None) -> HurdleXLearner:
+        y = np.asarray(y, dtype=float)
+        treatment = np.asarray(treatment, dtype=np.int8)
+        self.propensity_ = float(treatment.mean())
+        positive = (y > 0).astype(np.int8)
+        mask_t = treatment == 1
+        mask_c = treatment == 0
+
+        self.clf_t_ = _make_classifier(self.params, self.seed_offset + 41)
+        self.clf_c_ = _make_classifier(self.params, self.seed_offset + 42)
+        self.reg_t_ = _make_regressor(self.params, self.seed_offset + 43)
+        self.reg_c_ = _make_regressor(self.params, self.seed_offset + 44)
+
+        eval_clf_t = eval_clf_c = eval_reg_t = eval_reg_c = None
+        if eval_set is not None:
+            X_val, y_val, t_val = eval_set
+            y_val = np.asarray(y_val, dtype=float)
+            pos_val = (y_val > 0).astype(np.int8)
+            eval_clf_t = (X_val[t_val == 1], pos_val[t_val == 1])
+            eval_clf_c = (X_val[t_val == 0], pos_val[t_val == 0])
+            eval_reg_t = (X_val[(t_val == 1) & (y_val > 0)], np.log1p(y_val[(t_val == 1) & (y_val > 0)]))
+            eval_reg_c = (X_val[(t_val == 0) & (y_val > 0)], np.log1p(y_val[(t_val == 0) & (y_val > 0)]))
+
+        _fit_classifier(self.clf_t_, X[mask_t], positive[mask_t], self.params, eval_set=eval_clf_t)
+        _fit_classifier(self.clf_c_, X[mask_c], positive[mask_c], self.params, eval_set=eval_clf_c)
+
+        pos_t = mask_t & (y > 0)
+        pos_c = mask_c & (y > 0)
+        self.mean_pos_t_ = float(y[pos_t].mean()) if pos_t.any() else 0.0
+        self.mean_pos_c_ = float(y[pos_c].mean()) if pos_c.any() else 0.0
+        if pos_t.any():
+            _fit_regressor(self.reg_t_, X[pos_t], np.log1p(y[pos_t]), self.params, eval_set=eval_reg_t)
+        if pos_c.any():
+            _fit_regressor(self.reg_c_, X[pos_c], np.log1p(y[pos_c]), self.params, eval_set=eval_reg_c)
+
+        # Stage-2 imputed effects
+        D_t = y[mask_t] - self._expected_spend(X[mask_t], "c")
+        D_c = self._expected_spend(X[mask_c], "t") - y[mask_c]
+
+        eval_tau_t = eval_tau_c = None
+        if eval_set is not None:
+            X_val, y_val, t_val = eval_set
+            y_val = np.asarray(y_val, dtype=float)
+            mask_val_t = t_val == 1
+            mask_val_c = t_val == 0
+            if mask_val_t.any():
+                D_t_val = y_val[mask_val_t] - self._expected_spend(X_val[mask_val_t], "c")
+                eval_tau_t = (X_val[mask_val_t], D_t_val)
+            if mask_val_c.any():
+                D_c_val = self._expected_spend(X_val[mask_val_c], "t") - y_val[mask_val_c]
+                eval_tau_c = (X_val[mask_val_c], D_c_val)
+
+        self.tau_t_ = _make_regressor(self.params, self.seed_offset + 45)
+        self.tau_c_ = _make_regressor(self.params, self.seed_offset + 46)
+        _fit_regressor(self.tau_t_, X[mask_t], D_t, self.params, eval_set=eval_tau_t)
+        _fit_regressor(self.tau_c_, X[mask_c], D_c, self.params, eval_set=eval_tau_c)
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        assert self.tau_t_ is not None and self.tau_c_ is not None
+        g = self.propensity_
+        return g * self.tau_c_.predict(X) + (1.0 - g) * self.tau_t_.predict(X)
+
+    def feature_importances_(self, feature_names: list[str]) -> pd.Series:
+        imps = [
+            m.feature_importances_
+            for m in (self.tau_t_, self.tau_c_)
+            if m is not None and hasattr(m, "feature_importances_")
+        ]
+        if not imps:
+            return pd.Series(dtype=float)
+        return pd.Series(np.mean(imps, axis=0), index=feature_names).sort_values(ascending=False)
+
+
 class EnsembleUpliftModel(BaseUpliftModel):
     """Weighted ensemble. Rank mode focuses on stable ordering for uplift@10."""
 
@@ -410,6 +606,10 @@ def create_model(name: ModelName, params: LGBMParams) -> BaseUpliftModel:
         model = HurdleTwoModelRegressor(params, seed_offset)
     elif base_name == "r_learner":
         model = RLearner(params, seed_offset)
+    elif base_name == "x_learner":
+        model = XLearner(params, seed_offset)
+    elif base_name == "hurdle_x_learner":
+        model = HurdleXLearner(params, seed_offset)
     else:
         raise ValueError(f"Unknown model: {name}")
     model.name = name
@@ -418,10 +618,12 @@ def create_model(name: ModelName, params: LGBMParams) -> BaseUpliftModel:
 
 ALL_MODELS: tuple[ModelName, ...] = (
     "hurdle_t_learner",
-    "t_learner_log",
-    "s_learner_log",
-    "transformed_outcome",
-    "r_learner",
     "hurdle_t_learner_s101",
+    "hurdle_t_learner_s201",
+    "x_learner",
+    "x_learner_s101",
+    "hurdle_x_learner",
+    "hurdle_x_learner_s101",
+    "t_learner_log",
     "t_learner_log_s101",
 )

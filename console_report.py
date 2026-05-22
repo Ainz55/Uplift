@@ -55,6 +55,26 @@ def print_models_comparison(report: EvaluationReport, cfg: PipelineConfig) -> No
         logger.info("  Ensemble weights: %s", report.ensemble_weights)
 
 
+def print_leaderboard_proxy(report: EvaluationReport, cfg: PipelineConfig) -> None:
+    pct = int(round(cfg.top_k * 100))
+    key = f"uplift_at_{pct}pct_ci_lower"
+    raw_key = f"uplift_at_{pct}pct"
+    s = report.best_cv.summary
+    logger.info(_SEP)
+    logger.info("LEADERBOARD_PROXY")
+    logger.info(_SUB)
+    logger.info("  Best model:      %s", report.best_model_name)
+    logger.info("  Feature set:     %s", cfg.feature_set)
+    logger.info("  Metric:          lower %.0f%% bootstrap CI for uplift@%d%%", cfg.bootstrap_ci * 100, pct)
+    logger.info("  Proxy score:     %.5f", s.get(key, float("nan")))
+    logger.info("  Raw uplift@%d%%:  %.5f", pct, s.get(raw_key, float("nan")))
+    logger.info("  Target to beat:  20.00123")
+    logger.info(
+        "  Gap vs target:   %+.5f",
+        s.get(key, float("nan")) - 20.00123,
+    )
+
+
 def print_metrics(title: str, metrics: dict[str, float], cfg: PipelineConfig) -> None:
     logger.info(_SEP)
     logger.info(title.upper())
@@ -120,6 +140,7 @@ def print_full_report(
 ) -> None:
     print_dataset_info(info, n_features)
     print_models_comparison(report, cfg)
+    print_leaderboard_proxy(report, cfg)
     print_metrics(f"OOF metrics for {report.best_model_name}", oof_metrics, cfg)
     print_score_stats(report.oof_uplift, "OOF uplift")
     if test_uplift is not None and predictions_path:
