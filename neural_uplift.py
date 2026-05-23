@@ -348,32 +348,63 @@ def run_train(cfg: argparse.Namespace) -> None:
     pd.DataFrame({"user_id": test["user_id"].to_numpy(), "UPLIFT_SCORE": test_uplift}).to_csv(
         pred_path, index=False, encoding="utf-8"
     )
-    logger.info("Neural predictions saved: %s", pred_path)
+    logger.info("Neural predictions saved: %s")
 
 
 def run_infer(cfg: argparse.Namespace) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_dir = Path(cfg.dataset)
 
     checkpoint = torch.load(cfg.model_path, map_location="cpu")
     scaler: StandardScaler = checkpoint["scaler"]
     feature_cols: list[str] = checkpoint["feature_cols"]
 
-    _, test, _ = load_and_validate(dataset_dir)
-    X, X_test, _, _ = prepare_datasets(test, test, max_categories=40, feature_set="semantic")
-    X_test_s = torch.tensor(scaler.transform(X_test[feature_cols].values).astype(np.float32))
+    # Загружаем тестовые данные (обязательно --test-file)
+    if cfg.test_file:
+        test = pd.read_parquet(cfg.test_file)
+    else:
+        raise ValueError("Для инференса укажите --test-file")
+
+    # Удаляем лишние колонки
+    for col in ["treatment_flg", "rec_spend"]:
+        if col in test.columns:
+            test = test.drop(columns=[col])
+
+    # Загружаем train напрямую из {dataset}/train.parquet
+    if cfg.dataset:
+        train_path = Path(cfg.dataset) / "train.parquet"
+        if not train_path.exists():
+            raise FileNotFoundError(f"Не найден {train_path}")
+        train = pd.read_parquet(train_path)
+    else:
+        raise ValueError("Для инференса укажите --dataset (папка с train.parquet)")
+
+    # Подготавливаем признаки через prepare_datasets
+    _, X_test, _, _ = prepare_datasets(
+        train, test, max_categories=40, feature_set="semantic"
+    )
+
+    # Выравниваем колонки под feature_cols
+    for col in feature_cols:
+        if col not in X_test.columns:
+            X_test[col] = 0.0
+    X_test = X_test[feature_cols].fillna(0.0)
+
+    X_test_s = torch.tensor(
+        scaler.transform(X_test.values).astype(np.float32)
+    )
 
     model = TARNet(len(feature_cols))
     model.load_state_dict(checkpoint["state_dict"])
     model = model.to(DEVICE)
 
     uplift = model.predict_uplift(X_test_s.to(DEVICE))
-    pred_path = output_dir / "predictions_neural.csv"
-    pd.DataFrame({"user_id": test["user_id"].to_numpy(), "UPLIFT_SCORE": uplift}).to_csv(
-        pred_path, index=False, encoding="utf-8"
-    )
-    logger.info("Predictions saved: %s", pred_path)
+    pred_path = output_dir / "predictions.csv"
+    pd.DataFrame({
+        "user_id": test["user_id"].to_numpy(),
+        "UPLIFT_SCORE": uplift,
+    }).to_csv(pred_path, index=False, encoding="utf-8")
+    logger.info("Predictions saved: %s")
 
 
 def run_ensemble(cfg: argparse.Namespace) -> None:
@@ -420,6 +451,7 @@ def main() -> None:
     parser.add_argument("--output", default="output/neural/predictions_ensemble.csv")
     parser.add_argument("--lgbm-weight", type=float, default=0.6)
     parser.add_argument("--neural-weight", type=float, default=0.4)
+    parser.add_argument("--test-file", default=None, help="Путь к тестовому parquet (для инференса)")
 
     cfg = parser.parse_args()
 
