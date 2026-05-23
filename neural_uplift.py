@@ -360,8 +360,8 @@ def run_infer(cfg: argparse.Namespace) -> None:
     scaler: StandardScaler = checkpoint["scaler"]
     feature_cols: list[str] = checkpoint["feature_cols"]
 
-    _, test, _ = load_and_validate(dataset_dir)
-    X, X_test, _, _ = prepare_datasets(test, test, max_categories=40, feature_set="semantic")
+    train, test, _ = load_and_validate(dataset_dir)
+    _, X_test, _, _ = prepare_datasets(train, test, max_categories=40, feature_set="semantic")
     X_test_s = torch.tensor(scaler.transform(X_test[feature_cols].values).astype(np.float32))
 
     model = TARNet(len(feature_cols))
