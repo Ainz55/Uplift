@@ -1,7 +1,6 @@
 venv
 dataset
 reports
-output
 submission.csv
 predictions.csv
 .tmp
