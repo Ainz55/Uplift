@@ -13,4 +13,4 @@ predictions_baseline_17_92039.csv
 predictions_event_zero_candidate.csv
 predictions_hurdle.csv
 .dockerignore
-README.md
+model
