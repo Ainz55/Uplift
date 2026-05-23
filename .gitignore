@@ -16,4 +16,6 @@ predictions_event_zero_candidate.csv
 predictions_hurdle.csv
 .dockerignore
 README.md
-depr
+depr*.pt
+model/
+output/
